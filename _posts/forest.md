@@ -1,3 +1,8 @@
+---
+layout: post
+title: HTB - Forest
+---
+
 # Recon
 Our nmap scan shows the target is running Windows Server 2016, with open ports for DNS, Kerberos, and LDAP - indicating this is a Domain Controller for an Active Directory environment.
 ```shell-session
